@@ -57,34 +57,29 @@ impl OcrEngine {
     /// 
     /// This method preprocesses the image (resize, normalize) and runs inference.
     /// It also handles potential multi-line text by splitting vertically if clear gaps are found.
-    pub fn recognize(&mut self, img: &core::Mat) -> Result<String> {
+    /// Splits the image vertically into lines if multiple lines are detected.
+    /// Returns a vector of (Relative_Rect, Image_Chunk).
+    pub fn segment_lines(&mut self, img: &core::Mat) -> Result<Vec<(core::Rect, core::Mat)>> {
         if img.empty() { bail!("入力画像が空です。"); }
 
-        // 多段組チェック（簡易版）
-        // 目安: 中央値の1.5倍以上あれば2行の可能性がある
         let h = img.rows();
         let split_threshold = (self.avg_line_height as f32 * 1.5) as i32;
         
         if h > split_threshold {
             // グレースケール化 & 二値化
-            
-            // カラーなら変換、そうでなければコピー
             if img.channels() == 3 {
                 imgproc::cvt_color(img, &mut self.gray_buf, imgproc::COLOR_BGR2GRAY, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
             } else {
                 img.copy_to(&mut self.gray_buf)?;
             }
             
-            // 白黒反転（文字が白、背景黒になるように調整）
-            // 通常OCRは白地に黒文字が多いが、二値化で文字を抽出する
             imgproc::threshold(&self.gray_buf, &mut self.binary_buf, 0.0, 255.0, imgproc::THRESH_BINARY_INV | imgproc::THRESH_OTSU)?;
 
-            // 水平射影（行ごとの画素値合計）
+            // 水平射影
             let w = img.cols();
             let mut min_val = w as i32 * 255;
             let mut split_y = -1;
             
-            // 上下20%は無視して、中間領域で分割点を探す
             let start_y = (h as f32 * 0.2) as i32;
             let end_y = (h as f32 * 0.8) as i32;
             
@@ -94,35 +89,57 @@ impl OcrEngine {
                     let val = *self.binary_buf.at_2d::<u8>(y, x)? as i32;
                     if val > 0 { row_sum += 1; }
                 }
-                
-                // 行に含まれる白い画素（文字部分）が極端に少ない場所を探す
                 if row_sum < min_val {
                     min_val = row_sum;
                     split_y = y;
                 }
             }
 
-            // 分割点が見つかり、かつそこが十分に空白（幅の5%以下しか文字がない）なら分割
+            // 分割実行
             if split_y != -1 && (min_val as f32) < (w as f32 * 0.05) {
-                // 上下分割
                 let rect_top = core::Rect::new(0, 0, w, split_y);
                 let rect_bottom = core::Rect::new(0, split_y, w, h - split_y);
                 
-                let img_top = core::Mat::roi(img, rect_top)?;
-                let img_bottom = core::Mat::roi(img, rect_bottom)?; // Note: roi creates reference, safe to pass to recognize? Yes if properly cloned or handled.
-                
-                // 再帰呼び出しのためにMatをコピー（recognizeは&mut selfをとるがimgはimmutなのでOKだが、roi参照問題を避けるためコピー推奨）
+                // 再帰処理のために画像をクローンしておく
                 let mut top_clone = core::Mat::default();
                 let mut bot_clone = core::Mat::default();
-                img_top.copy_to(&mut top_clone)?;
-                img_bottom.copy_to(&mut bot_clone)?;
+                core::Mat::roi(img, rect_top)?.copy_to(&mut top_clone)?;
+                core::Mat::roi(img, rect_bottom)?.copy_to(&mut bot_clone)?;
                 
-                let res_top = self.recognize(&top_clone)?;
-                let res_bottom = self.recognize(&bot_clone)?;
+                let mut top_results = self.segment_lines(&top_clone)?;
+                let mut bot_results = self.segment_lines(&bot_clone)?;
                 
-                return Ok(format!("{}\n{}", res_top, res_bottom));
+                // ボトム側のY座標をオフセット
+                for (r, _) in &mut bot_results {
+                    r.y += split_y;
+                }
+                
+                top_results.append(&mut bot_results);
+                return Ok(top_results);
             }
         }
+
+        // 分割なし
+        let mut clone = core::Mat::default();
+        img.copy_to(&mut clone)?;
+        Ok(vec![(core::Rect::new(0, 0, img.cols(), h), clone)])
+    }
+
+    /// Public wrapper for backward compatibility.
+    /// Recognizes text by potentially splitting lines, then joining them with newline.
+    #[allow(dead_code)]
+    pub fn recognize(&mut self, img: &core::Mat) -> Result<String> {
+        let segments = self.segment_lines(img)?;
+        let mut texts = Vec::new();
+        for (_, seg_img) in segments {
+            texts.push(self.recognize_chunk(&seg_img)?);
+        }
+        Ok(texts.join("\n"))
+    }
+
+    /// Performs inference on a single image chunk (no splitting).
+    pub(crate) fn recognize_chunk(&mut self, img: &core::Mat) -> Result<String> {
+        if img.empty() { return Ok(String::new()); }
 
         let target_h = 48;
         let aspect_ratio = img.cols() as f32 / img.rows() as f32;
@@ -163,8 +180,12 @@ impl OcrEngine {
             last_index = max_idx;
         }
         
-
+        // 誤認識の補正 (Post-Correction)
+        // 合言(misread), 合计(simplified Chinese) -> 合計
+        let corrected_text = recognized_text
+            .replace("合言", "合計")
+            .replace("合计", "合計");
         
-        Ok(recognized_text)
+        Ok(corrected_text)
     }
 }

@@ -17,5 +17,5 @@ sha2 = "0.10"
 regex = "1.12.2"
 
 [[bin]]
-name = "AILoupe_Accounting"
+name = "sleek_accounts"
 path = "src/main.rs"

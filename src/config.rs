@@ -12,7 +12,7 @@ impl AppConfig {
     pub const OUTPUT_DIR: &'static str = "output";
 
     // UI/表示設定
-    pub const WINDOW_NAME: &'static str = "AILoupe_Accounting";
+    pub const WINDOW_NAME: &'static str = "Sleek Accounts";
     pub const DEFAULT_WIN_W: i32 = 600;
     pub const DEFAULT_WIN_H: i32 = 800;
     pub const RENDER_WIDTH: i32 = 1200; // main.rsの型エラー防止のためi32

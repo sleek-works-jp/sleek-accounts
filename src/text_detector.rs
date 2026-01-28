@@ -1,4 +1,6 @@
 use opencv::{core, prelude::*, imgproc};
+#[cfg(debug_assertions)]
+use opencv::imgcodecs;
 use ort::{session::Session, value::Value, inputs};
 use ndarray::Array4;
 use anyhow::Result;
@@ -70,7 +72,7 @@ impl TextDetector {
     /// 
     /// # Returns
     /// A vector of `Detection` results.
-    pub fn detect(&mut self, frame: &core::Mat, ocr: &mut OcrEngine, page_num: u16) -> Result<Vec<Detection>> {
+    pub fn detect(&mut self, frame: &core::Mat, ocr: &mut OcrEngine, _page_num: u16) -> Result<Vec<Detection>> {
         let input_array = self.preprocess_letterbox(frame)?;
         let input_tensor = Value::from_array(input_array)?;
         let outputs = self.session.run(inputs![&input_tensor])?;
@@ -122,6 +124,36 @@ impl TextDetector {
         // OCRエンジンの行高さ基準を補正 (中央値算出)
         ocr.calibrate_line_height(&all_rects);
 
+        // =========================================================
+        // [DEBUG] 全検出矩形 (Raw) の画像出力
+        // リリースビルドではコンパイルから除外されます
+        // =========================================================
+        #[cfg(debug_assertions)]
+        {
+            use std::fs;
+            let debug_dir = "debug_output";
+            if !std::path::Path::new(debug_dir).exists() {
+                let _ = fs::create_dir_all(debug_dir);
+            }
+
+            let mut debug_img = frame.clone();
+            for rect in &all_rects {
+                // 青色 (BGR: 255, 0, 0) で描画
+                let _ = imgproc::rectangle(
+                    &mut debug_img,
+                    *rect,
+                    core::Scalar::new(255.0, 0.0, 0.0, 0.0),
+                    2,
+                    imgproc::LINE_8,
+                    0
+                );
+            }
+            
+            let filename = format!("{}/Page_{}_detect_raw.png", debug_dir, _page_num);
+            let _ = imgcodecs::imwrite(&filename, &debug_img, &core::Vector::new());
+        }
+        // =========================================================
+
         // Perform OCR-based content filtering to remove redundant detections
         let mut content_filtered_rects = Vec::new();
         
@@ -137,17 +169,64 @@ impl TextDetector {
         let mut scanned_rects = Vec::new();
 
         for (_idx, rect) in all_rects.iter().enumerate() {
-            let mut text = String::new();
             if let Ok(roi_ref) = core::Mat::roi(frame, *rect) {
                 if roi_ref.copy_to(&mut self.roi_buf).is_ok() {
-                   if let Ok(res) = ocr.recognize(&self.roi_buf) {
-                       text = res;
-                   }
+                    // まず垂直分割を試みる (2行以上のものを分割)
+                    if let Ok(segments) = ocr.segment_lines(&self.roi_buf) {
+                    for (rel_rect, seg_img) in segments {
+                        // 相対座標を絶対座標に変換
+                        let abs_rect = core::Rect::new(
+                            rect.x + rel_rect.x,
+                            rect.y + rel_rect.y,
+                            rel_rect.width,
+                            rel_rect.height
+                        );
+                        
+                        let mut text = String::new();
+                        // 分割された画像チャンクに対して個別に認識を実行
+                        if let Ok(res) = ocr.recognize_chunk(&seg_img) {
+                            text = res;
+                        }
+                        
+                        scanned_rects.push(ScannedRect { rect: abs_rect, text });
+                    }
                 }
             }
-            // OCR失敗時は空文字が入る
-            scanned_rects.push(ScannedRect { rect: *rect, text });
         }
+    }
+
+        // =========================================================
+        // [DEBUG] 全矩形のOCR結果をテキストファイル出力
+        // =========================================================
+        #[cfg(debug_assertions)]
+        #[cfg(debug_assertions)]
+        {
+            use std::fs;
+            use std::io::Write;
+            
+            let debug_dir = "debug_output";
+            if !std::path::Path::new(debug_dir).exists() {
+                let _ = fs::create_dir_all(debug_dir);
+            }
+
+            let txt_filename = format!("{}/Page_{}_detect_raw.txt", debug_dir, _page_num);
+            // OpenOptionsではなく単純なFile::createを使用 (上書き作成)
+            match fs::File::create(&txt_filename) {
+                Ok(mut file) => {
+                    for (i, sr) in scanned_rects.iter().enumerate() {
+                        let _ = writeln!(
+                            file,
+                            "Rect[{}]: x={}, y={}, w={}, h={}\nText:\n{}\n----------------------------------------",
+                            i, sr.rect.x, sr.rect.y, sr.rect.width, sr.rect.height, sr.text
+                        );
+                    }
+                },
+                Err(e) => {
+                    println!("[DEBUG ERROR] Failed to create log file {}: {:?}", txt_filename, e);
+                }
+            }
+        }
+        // =========================================================
 
         // 2. Filter based on content (Keyword & Overlap check)
 

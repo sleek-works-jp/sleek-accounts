@@ -22,6 +22,8 @@ mod ui;
 mod config;
 
 use opencv::{core, highgui, imgproc, prelude::*};
+#[cfg(debug_assertions)]
+use opencv::imgcodecs;
 use pdfium_render::prelude::*;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -133,6 +135,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut needs_reload = true;
     let mut s_key_locked = false;
+    
+    // デバッグ保存用トリガー
+    #[cfg(debug_assertions)]
+    let mut debug_save_trigger = false;
 
     loop {
         let current_p = { state.lock().expect("Failed to lock state").current_page };
@@ -161,6 +167,8 @@ fn main() -> anyhow::Result<()> {
             // 【照合】今のページ番号と解析結果の番号が一致する場合のみ描画に反映
             if res_page_idx == s.current_page {
                 s.detections = new_dets;
+                #[cfg(debug_assertions)]
+                { debug_save_trigger = true; }
             }
         }
 
@@ -188,6 +196,32 @@ fn main() -> anyhow::Result<()> {
                 
                 if s.save_msg_timer > 0 { s.save_msg_timer -= 1; }
             }
+
+            // =========================================================
+            // [DEBUG] 最終描画結果の保存 (検出更新時のみ)
+            // =========================================================
+            #[cfg(debug_assertions)]
+            if debug_save_trigger {
+                use std::fs;
+                let debug_dir = "debug_output";
+                if !std::path::Path::new(debug_dir).exists() {
+                     let _ = fs::create_dir_all(debug_dir);
+                }
+                
+                let current_p = { state.lock().unwrap().current_page };
+                let filename = format!("{}/Page_{}_final_view.png", debug_dir, current_p);
+                // main_display_view は RGB なので BGR に戻してから保存しないと色が変になる可能性があるが
+                // to_str().unwrap() は main_display_view が BGR2RGB 済みであることを考慮すると
+                // imwrite は BGR を期待するので、ここで再度変換が必要。
+                
+                let mut save_buf = core::Mat::default();
+                let _ = imgproc::cvt_color(&main_display_view, &mut save_buf, imgproc::COLOR_RGB2BGR, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT);
+                let _ = imgcodecs::imwrite(&filename, &save_buf, &core::Vector::new());
+                
+                debug_save_trigger = false;
+            }
+            // =========================================================
+
             highgui::imshow(AppConfig::WINDOW_NAME, &main_display_view)?;
         }
 
